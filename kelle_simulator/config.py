@@ -35,7 +35,20 @@ class ModelConfig:
         return self.d_model * 2
 
     def weight_bytes(self, in_dim: int, out_dim: int) -> int:
-        return in_dim * out_dim * (self.weight_bits // 8)
+        """Bytes for a weight matrix, correctly handling sub-byte (INT4 = 0.5 B/elem)."""
+        return in_dim * out_dim * self.weight_bits // 8
+
+    @property
+    def total_weight_bytes(self) -> int:
+        """Total bytes for all transformer weight matrices at current weight_bits."""
+        num_weights_per_layer = (
+            3 * self.d_model * self.d_model +  # QKV
+            self.d_model * self.d_model +       # O proj
+            self.d_model * self.d_ffn +         # FFN up
+            self.d_ffn * self.d_model           # FFN down
+        )
+        bytes_per_layer = num_weights_per_layer * self.weight_bits // 8
+        return bytes_per_layer * self.num_layers
 
 
 @dataclass
@@ -47,6 +60,11 @@ class HardwareConfig:
 
     # ── Memory sizes ─────────────────────────────────────────────────────────
     sram_size_bytes: int        = 2 * 1024 * 1024    # 2 MB weight SRAM
+    weight_prefetch_buffer_bytes: int = 0
+    # When > 0: all weights are loaded from DRAM once at the start of prefill
+    # and held in this on-chip buffer for the entire inference sequence.
+    # Served at SRAM energy/bandwidth. Set to >= model.total_weight_bytes to activate.
+    # FPGA example: 45*1024*1024 for OPT-125M at INT4 (~42 MB)
     edram_kvcache_bytes: int    = 4 * 1024 * 1024    # 4 MB KV-cache eDRAM
     edram_activation_bytes: int = 256 * 1024          # 256 KB activation eDRAM
     dram_size_gb: float         = 16.0
@@ -143,6 +161,11 @@ class HardwareConfig:
 # Pre-defined model configurations
 # ─────────────────────────────────────────────────────────────────────────────
 
+FPGA_HW_CONFIG = HardwareConfig(
+    weight_prefetch_buffer_bytes=45 * 1024 * 1024,  # 45 MB — fits OPT-125M INT4
+    sram_size_bytes=4 * 1024 * 1024,                 # 4 MB (larger FPGA BRAM)
+)
+
 MODELS: Dict[str, ModelConfig] = {
     "opt-125m": ModelConfig(
         name="OPT-125M",
@@ -173,6 +196,17 @@ MODELS: Dict[str, ModelConfig] = {
         head_dim=128,
         vocab_size=50272,
         max_seq_len=2048,
+    ),
+    "opt-125m-int4": ModelConfig(
+        name="OPT-125M-INT4",
+        num_layers=12,
+        num_heads=12,
+        d_model=768,
+        d_ffn=3072,
+        head_dim=64,
+        vocab_size=50272,
+        max_seq_len=2048,
+        weight_bits=4,
     ),
 }
 

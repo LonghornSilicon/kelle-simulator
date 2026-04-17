@@ -30,6 +30,78 @@ from .rsa import RSA
 from .sfu import SFU
 
 
+# ---------------------------------------------------------------------------
+# Realistic attention weight model
+# ---------------------------------------------------------------------------
+# Based on empirical observations from H2O, SnapKV, and StreamingLLM:
+#   - Attention sink: first N tokens capture disproportionate mass
+#   - Recency bias: last R tokens decay exponentially toward present
+#   - Content routing: head-specific focus on semantically relevant tokens
+#
+# Three head archetypes (cycled by head index):
+#   Sink heads   (head % 3 == 0): strong initial-token focus
+#   Recency heads(head % 3 == 1): strong local/recent focus
+#   Content heads(head % 3 == 2): focus on pseudo-content tokens that vary
+#                                   by (layer, head) -- models sparse routing
+
+def _head_attention_weights(
+    sorted_token_ids: List[int],
+    layer: int,
+    head: int,
+    initial_preserved: int,
+    recent_window: int,
+) -> Dict[int, float]:
+    """
+    Generate a realistic (non-uniform) attention distribution for one head.
+
+    Returns a normalised dict {token_id: weight}.
+    """
+    n = len(sorted_token_ids)
+    if n == 0:
+        return {}
+
+    effective_recent = min(recent_window, max(1, n // 2))
+    head_type = head % 3
+
+    raw: Dict[int, float] = {}
+    for i, tid in enumerate(sorted_token_ids):
+        pos_from_end = n - 1 - i
+
+        if head_type == 0:
+            # Sink head: heavy on initial tokens, light recency, near-zero middle
+            sink    = 4.0 if i < initial_preserved else 0.0
+            recency = math.exp(-pos_from_end * 6.0 / max(effective_recent, 1)) \
+                      if pos_from_end < effective_recent else 0.0
+            content = 0.02
+            w = sink + recency + content
+
+        elif head_type == 1:
+            # Recency head: strong exponential decay from present
+            sink    = 0.5 if i < initial_preserved else 0.0
+            recency = math.exp(-pos_from_end * 3.0 / max(effective_recent, 1)) \
+                      if pos_from_end < effective_recent else 0.0
+            content = 0.02 + 0.08 * max(0.0, math.sin(tid * 0.31 + layer * 0.9))
+            w = sink + recency + content
+
+        else:
+            # Content head: sparse focus on pseudo-content tokens.
+            # Uses a deterministic hash so the same token is repeatedly
+            # attended to across decode steps, simulating real content routing.
+            sink      = 0.3 if i < initial_preserved else 0.0
+            recency   = math.exp(-pos_from_end * 2.0 / max(effective_recent, 1)) \
+                        if pos_from_end < effective_recent else 0.0
+            # Content signal: high for tokens whose id hashes with (layer, head)
+            content_signal = (tid * 6364136223846793005 + layer * 1442695040888963407
+                              + head * 2862933555777941757) & 0xFFFFFFFF
+            content = 0.05 + 1.2 * (content_signal / 0xFFFFFFFF) ** 6
+            w = sink + recency + content
+
+        raw[tid] = max(w, 1e-9)
+
+    total = sum(raw.values())
+    return {tid: v / total for tid, v in raw.items()}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Statistics container
 # ─────────────────────────────────────────────────────────────────────────────
@@ -192,6 +264,13 @@ class KelleSimulator:
         phase.tokens_processed = prompt_len
         m = self.model
 
+        # One-time weight prefetch: load all weights from DRAM into on-chip buffer.
+        # This one-time cost replaces per-step-per-layer DRAM weight loads during decode.
+        if self.memory._weight_prefetch_active:
+            pf_result = self.memory.prefetch_weights()
+            phase.dram_energy_pj += pf_result.energy_pj
+            self._tick(pf_result.cycles, phase)
+
         for layer in range(m.num_layers):
             # Layer norm (pre-attention)
             self._add_sfu(self.sfu.layer_norm(prompt_len * m.d_model), phase)
@@ -321,12 +400,22 @@ class KelleSimulator:
             # ── Softmax + evictor attention-score update ──────────────────────
             self._add_sfu(self.sfu.softmax_decode(kv_len, m.num_heads), phase)
 
-            # Simulate uniform attention weights for importance tracking
-            attn_weights = {
-                tid: 1.0 / kv_len for tid in self.aerp._tokens
-            }
-            evc = self.evictor.accumulate_scores(attn_weights, layer, head=0)
-            self._tick(evc, phase)
+            # Realistic per-head attention weights (sink / recency / content).
+            # Called once per head per layer so head_counts in the evictor
+            # reflects which tokens are consistently above-mean across heads,
+            # enabling AERP to distinguish full-evict vs recompute candidates.
+            sorted_tids = sorted(self.aerp._tokens.keys())
+            total_evc = 0
+            for head_idx in range(m.num_heads):
+                attn_weights = _head_attention_weights(
+                    sorted_tids, layer, head_idx,
+                    self.hw.initial_tokens_preserved,
+                    self.hw.recent_window_tokens,
+                )
+                total_evc += self.evictor.accumulate_scores(
+                    attn_weights, layer, head_idx)
+            # Evictor runs in parallel with RSA; charge only 1 cycle per layer
+            self._tick(1, phase)
 
             # ── Attention output: scores × V ──────────────────────────────────
             self._add_compute(self.rsa.attention_output_decode(kv_len, layer), phase)
@@ -504,6 +593,13 @@ class KelleSimulator:
         print(f"  eDRAM utilisation : {100*edram_util:.1f}%  "
               f"({self.memory.kv_edram.used_bytes/1024:.1f} KB / "
               f"{hw.edram_kvcache_bytes/1024:.0f} KB)")
+        if self.memory._weight_prefetch_active:
+            buf_mb = hw.weight_prefetch_buffer_bytes / 1024**2
+            model_mb = m.total_weight_bytes / 1024**2
+            print(f"  Weight prefetch   : ENABLED ({model_mb:.1f} MB / {buf_mb:.1f} MB buffer)")
+            print(f"  One-time load     : {self.memory.prefetch_load_bytes/1024:.1f} KB from DRAM")
+        else:
+            print(f"  Weight prefetch   : disabled (weights reload from DRAM each step)")
 
         print(f"\n-- Hardware (reference) {DIV[:33]}")
         print(f"  On-chip area      : {hw.total_on_chip_area_mm2:.1f} mm2")
@@ -511,6 +607,8 @@ class KelleSimulator:
         print(f"  Off-chip DRAM pwr : {hw.dram_power_w:.2f} W")
         print(f"  Systolic evictor  : {hw.systolic_evictor_area_mm2:.2f} mm2  "
               f"{hw.systolic_evictor_power_w*1000:.0f} mW")
+        if hw.weight_prefetch_buffer_bytes > 0:
+            print(f"  Weight buf (FPGA) : {hw.weight_prefetch_buffer_bytes/1024**2:.0f} MB on-chip")
 
         print(f"\n-- Simulation overhead {DIV[:34]}")
         print(f"  Wall-clock time   : {wall:.3f} s")

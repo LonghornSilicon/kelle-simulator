@@ -11,6 +11,7 @@ Usage examples:
 
 from __future__ import annotations
 import argparse
+import dataclasses
 import json
 import sys
 import os
@@ -57,11 +58,20 @@ TITANUS_REFERENCE = {
 
 
 def run(args: argparse.Namespace) -> KelleSimulator:
+    if args.fpga:
+        args.weight_bits = 4
+        if args.weight_prefetch_mb == 0:
+            args.weight_prefetch_mb = 45
+
     model_cfg = MODELS[args.model]
+    if args.weight_bits != model_cfg.weight_bits:
+        model_cfg = dataclasses.replace(model_cfg, weight_bits=args.weight_bits)
+
     hw_cfg    = HardwareConfig(
         kv_cache_capacity_tokens=args.kv_capacity,
         recent_window_tokens=args.recent_window,
         initial_tokens_preserved=args.initial_tokens,
+        weight_prefetch_buffer_bytes=args.weight_prefetch_mb * 1024 * 1024,
     )
 
     sim = KelleSimulator(model_cfg, hw_cfg)
@@ -251,6 +261,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Sweep KV cache capacity [32,64,128,256,512] and tabulate")
     p.add_argument("--quiet",           action="store_true",
                    help="Suppress step-by-step progress output")
+    p.add_argument("--weight-bits",        type=int, default=8, choices=[4, 8, 16],
+                   help="Weight quantization bits (4=INT4, 8=INT8, 16=FP16) (default: 8)")
+    p.add_argument("--weight-prefetch-mb", type=int, default=0,
+                   help="On-chip weight prefetch buffer size in MB. "
+                        "When >= model weight size, weights load once from DRAM at prefill start. "
+                        "Set to 45 for OPT-125M INT4 on FPGA. (default: 0 = disabled)")
+    p.add_argument("--fpga",               action="store_true",
+                   help="FPGA mode: INT4 weights + 45 MB prefetch buffer (shortcut for "
+                        "--weight-bits 4 --weight-prefetch-mb 45)")
     return p
 
 

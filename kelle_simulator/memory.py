@@ -71,10 +71,11 @@ class WeightSRAM:
         # QKV projection: 3 × d_model × d_model
         # Output proj: d_model × d_model
         # FFN: d_model × d_ffn + d_ffn × d_model
-        layer_w = (3 * m.d_model * m.d_model +
-                   m.d_model * m.d_model +
-                   m.d_model * m.d_ffn +
-                   m.d_ffn * m.d_model) * (m.weight_bits // 8)
+        num_weights = (3 * m.d_model * m.d_model +
+                       m.d_model * m.d_model +
+                       m.d_model * m.d_ffn +
+                       m.d_ffn * m.d_model)
+        layer_w = num_weights * m.weight_bits // 8
         return (self._used_bytes + layer_w) <= self.hw.sram_size_bytes
 
 
@@ -292,6 +293,12 @@ class MemoryHierarchy:
         self.activation_edram = ActivationEDRAM(hw)
         self.dram             = OffChipDRAM(hw)
 
+        # Prefetch buffer tracking
+        self.prefetch_load_bytes: int = 0
+        self.prefetch_load_energy_pj: float = 0.0
+        self.prefetch_load_cycles: int = 0
+        self._weight_prefetch_active: bool = False
+
         # Determine which layers fit in SRAM
         self._sram_resident_layers: set[int] = set()
         self._init_weight_placement()
@@ -299,18 +306,36 @@ class MemoryHierarchy:
     def _init_weight_placement(self):
         """Greedily pack transformer layers into SRAM; overflow goes to DRAM."""
         m = self.model
-        bytes_per_layer = (
+        num_weights_per_layer = (
             3 * m.d_model * m.d_model +   # QKV proj
             m.d_model * m.d_model +         # O proj
             m.d_model * m.d_ffn +           # FFN up
             m.d_ffn * m.d_model             # FFN down
-        ) * (m.weight_bits // 8)
+        )
+        bytes_per_layer = num_weights_per_layer * m.weight_bits // 8
 
+        # Prefetch buffer takes priority: if all weights fit, mark all layers resident
+        if (self.hw.weight_prefetch_buffer_bytes > 0 and
+                m.total_weight_bytes <= self.hw.weight_prefetch_buffer_bytes):
+            self._sram_resident_layers = set(range(m.num_layers))
+            self._weight_prefetch_active = True
+            return
+
+        # Original greedy SRAM packing
         budget = self.hw.sram_size_bytes
         for layer in range(m.num_layers):
             if bytes_per_layer <= budget:
                 self._sram_resident_layers.add(layer)
                 budget -= bytes_per_layer
+
+    def prefetch_weights(self) -> AccessResult:
+        """One-time DRAM load of all weights into the prefetch buffer (called once during prefill)."""
+        total_bytes = self.model.total_weight_bytes
+        r = self.dram.read(total_bytes)
+        self.prefetch_load_bytes = total_bytes
+        self.prefetch_load_energy_pj = r.energy_pj
+        self.prefetch_load_cycles = r.cycles
+        return r
 
     def load_weights(self, layer: int, num_bytes: int) -> AccessResult:
         if layer in self._sram_resident_layers:

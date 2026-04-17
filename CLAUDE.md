@@ -22,6 +22,12 @@ python -m kelle_simulator.run_simulation --sweep-kv-capacity
 
 # Compare against Titanus baseline
 python -m kelle_simulator.run_simulation --compare-titanus
+
+# FPGA mode: INT4 weights + 45 MB on-chip prefetch buffer (load once, no per-step DRAM)
+python -m kelle_simulator.run_simulation --model opt-125m --fpga --prompt 128 --generate 128
+
+# Manual weight quantization + prefetch
+python -m kelle_simulator.run_simulation --model opt-125m --weight-bits 4 --weight-prefetch-mb 45
 ```
 
 No dependencies — stdlib only (Python 3.8+). No install step required.
@@ -40,6 +46,8 @@ This is a functional+timing simulator (not gate-level). A single global cycle co
 
 **Energy attribution:** `ComputeResult` separates `rsa_energy_pj`, `weight_energy_pj` (routes to `sram_energy_pj` or `dram_energy_pj` depending on `weight_from_dram`), and `act_energy_pj`. For OPT-125M (81 MB > 2 MB SRAM), DRAM weight streaming dominates (~95% of decode energy).
 
+**Weight prefetch buffer (FPGA optimization):** When `hw.weight_prefetch_buffer_bytes > 0` and the quantized model fits (checked in `memory._init_weight_placement()`), all weight layers are marked SRAM-resident and a single DRAM load is issued at the start of prefill. All decode steps then read weights from the on-chip buffer at SRAM energy/bandwidth. For OPT-125M at INT4 (~42 MB), a 45 MB buffer eliminates the 98.9% DRAM weight streaming that dominates Kelle's energy profile.
+
 **Attention weights are uniform** (`1/kv_len`) in the current simulator. This means recompute events never trigger (all tokens get equal importance). Replace `attn_weights` in `simulator._decode_step()` to use real scores from a model for AERP recomputation to activate.
 
 ## Key extension points
@@ -52,6 +60,7 @@ This is a functional+timing simulator (not gate-level). A single global cycle co
 | Titanus comparison numbers | `run_simulation.py:TITANUS_REFERENCE` dict |
 | Bank conflict modelling | `memory.py:KVCacheEDRAM.store_kv()` |
 | Gate-level refresh energy | `edram_controller.py:EDRAMBank.refresh()` |
+| FPGA weight prefetch | `config.py:HardwareConfig.weight_prefetch_buffer_bytes` + `memory.py:prefetch_weights()` |
 
 ## Research context
 

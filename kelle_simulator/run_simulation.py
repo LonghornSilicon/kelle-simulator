@@ -30,11 +30,28 @@ from kelle_simulator.simulator import KelleSimulator
 
 TITANUS_REFERENCE = {
     "opt-125m": {
-        "prefill_latency_ms":    None,   # fill in from your Titanus simulator
+        # From Titanus simulator run: OPT-125M, 32 prefill + 32 decode tokens
+        # Run: python run_simulator.py --config_path config/config_opt125m_32_32_TT.yaml
+        #       --constants_path constant/constants.yaml
+        # Titanus uses HBM (256 GB/s), DCIM macros, CPQ compression, 12 parallel cores
+        "prefill_latency_ms":    None,   # Titanus does not separate prefill/decode latency
         "decode_latency_ms":     None,
-        "throughput_toks_per_s": None,
-        "total_energy_uj":       None,
-        "notes": "placeholder -- run Titanus simulator to obtain reference values",
+        "total_latency_ms":      3.404,  # intra-layer pipeline + inter-layer parallelism
+        "throughput_toks_per_s": 18801.47,
+        "total_energy_uj":       40642.69,
+        "energy_per_tok_uj":     84.19,  # per Titanus internal accounting
+        "area_mm2_per_core":     83.32,
+        "area_mm2_total":        999.84,  # 12 cores
+        "power_mw":              31950.15,
+        "clock_mhz":             200,
+        "memory_type":           "HBM 256 GB/s",
+        "seq_config":            "32 prefill + 32 decode",
+        "notes": (
+            "Titanus: DCIM-based accelerator (GLSVLSI 2025). "
+            "Latency is post-pipeline-optimization (intra+inter-layer). "
+            "Energy metric denominator differs from Kelle (see ARCHITECTURE.md). "
+            "Kelle comparison run: 32 prefill + 32 decode for consistency."
+        ),
     }
 }
 
@@ -136,35 +153,48 @@ def _compare_titanus(sim: KelleSimulator, model_key: str) -> None:
     ref = TITANUS_REFERENCE.get(model_key, {})
     s   = sim.stats
 
-    print("\n-- Kelle vs Titanus comparison --------------------------")
-    print(f"  {'Metric':<30}  {'Kelle':>12}  {'Titanus':>12}  {'Ratio':>8}")
-    print(f"  {'-'*30}  {'-'*12}  {'-'*12}  {'-'*8}")
+    seq_note = ref.get('seq_config', 'see TITANUS_REFERENCE')
+    print(f"\n-- Kelle vs Titanus comparison ({model_key}, {seq_note}) --")
+    print(f"  {'Metric':<34}  {'Kelle':>14}  {'Titanus':>14}  {'Ratio (K/T)':>12}")
+    print(f"  {'-'*34}  {'-'*14}  {'-'*14}  {'-'*12}")
 
-    metrics = [
-        ("Prefill latency (ms)",   f"{s.prefill_latency_ms:.3f}",
-         ref.get('prefill_latency_ms')),
-        ("Decode latency (ms)",    f"{s.decode_latency_ms:.3f}",
-         ref.get('decode_latency_ms')),
-        ("Throughput (tok/s)",     f"{s.throughput_tokens_per_sec():.1f}",
-         ref.get('throughput_toks_per_s')),
-        ("Total energy (uJ)",      f"{s.total_energy_pj/1e6:.2f}",
-         ref.get('total_energy_uj')),
-    ]
-
-    for name, kelle_val, titanus_val in metrics:
+    def row(name, kelle_val_str, titanus_val, lower_is_better=True):
         if titanus_val is not None:
             try:
-                ratio = float(kelle_val) / float(titanus_val)
-                ratio_str = f"{ratio:.2f}x"
+                ratio = float(kelle_val_str) / float(titanus_val)
+                direction = "worse" if (ratio > 1) == lower_is_better else "better"
+                ratio_str = f"{ratio:.2f}x ({direction})"
             except (ValueError, ZeroDivisionError):
                 ratio_str = "N/A"
+            titanus_str = f"{titanus_val:>14.3f}"
         else:
-            ratio_str = "N/A"
-        titanus_str = f"{titanus_val:.3f}" if titanus_val is not None else "(pending)"
-        print(f"  {name:<30}  {kelle_val:>12}  {titanus_str:>12}  {ratio_str:>8}")
+            ratio_str = "N/A (pending)"
+            titanus_str = f"{'(pending)':>14}"
+        print(f"  {name:<34}  {kelle_val_str:>14}  {titanus_str}  {ratio_str:>12}")
 
+    total_lat = s.total_latency_ms
+    ref_total = ref.get('total_latency_ms') or (
+        (ref.get('prefill_latency_ms') or 0) + (ref.get('decode_latency_ms') or 0)
+        or None
+    )
+
+    n_decode = max(len(s.decode_latency_per_step), 1)
+    kelle_uj_per_tok = s.total_energy_pj / 1e6 / n_decode
+
+    row("Total latency (ms)",         f"{total_lat:.3f}",                ref_total)
+    row("Prefill latency (ms)",        f"{s.prefill_latency_ms:.3f}",    ref.get('prefill_latency_ms'))
+    row("Decode latency (ms)",         f"{s.decode_latency_ms:.3f}",     ref.get('decode_latency_ms'))
+    row("Throughput (tok/s)",          f"{s.throughput_tokens_per_sec():.1f}", ref.get('throughput_toks_per_s'), lower_is_better=False)
+    row("Total energy (uJ)",           f"{s.total_energy_pj/1e6:.2f}",  ref.get('total_energy_uj'))
+    row("Energy/decode-token (uJ)",    f"{kelle_uj_per_tok:.2f}",        ref.get('energy_per_tok_uj'))
+    row("On-chip area (mm2)",          f"{sim.hw.total_on_chip_area_mm2:.1f}",
+        ref.get('area_mm2_per_core'))
+    row("On-chip power (W)",            f"{sim.hw.total_power_w:.2f}",    ref.get('power_mw') and ref['power_mw']/1000)
+
+    print(f"\n  Kelle memory:   LPDDR-style DRAM 64 GB/s, 4 MB eDRAM KV cache, AERP eviction")
+    print(f"  Titanus memory: HBM 256 GB/s, 4 MB global SRAM buffer, CPQ KV compression")
+    print(f"  Target context: Kelle=edge/IoT (9.5 mm2), Titanus=datacenter (999 mm2 x12 cores)")
     print(f"\n  Notes: {ref.get('notes', 'N/A')}")
-    print(f"  To add Titanus numbers, edit TITANUS_REFERENCE in run_simulation.py")
     print()
 
 

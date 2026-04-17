@@ -31,27 +31,27 @@ from kelle_simulator.simulator import KelleSimulator
 
 TITANUS_REFERENCE = {
     "opt-125m": {
-        # From Titanus simulator run: OPT-125M, 32 prefill + 32 decode tokens
-        # Run: python run_simulator.py --config_path config/config_opt125m_32_32_TT.yaml
-        #       --constants_path constant/constants.yaml
+        # From Titanus simulator run: OPT-125M, 128 prefill + 128 decode tokens
+        # Run: python run_simulator.py --config_path config/config_opt125m_128_128_TT.yaml
+        #       --constants_path constant/constants.yaml --logs_dir ./logs_128_128/
         # Titanus uses HBM (256 GB/s), DCIM macros, CPQ compression, 12 parallel cores
         "prefill_latency_ms":    None,   # Titanus does not separate prefill/decode latency
         "decode_latency_ms":     None,
-        "total_latency_ms":      3.404,  # intra-layer pipeline + inter-layer parallelism
-        "throughput_toks_per_s": 18801.47,
-        "total_energy_uj":       40642.69,
-        "energy_per_tok_uj":     84.19,  # per Titanus internal accounting
+        "total_latency_ms":      12.926,  # intra+inter-layer pipeline optimisation
+        "throughput_toks_per_s": 19804.69,
+        "total_energy_uj":       108616.27,
+        "energy_per_tok_uj":     286.55,  # per Titanus internal accounting
         "area_mm2_per_core":     83.32,
         "area_mm2_total":        999.84,  # 12 cores
         "power_mw":              31950.15,
         "clock_mhz":             200,
         "memory_type":           "HBM 256 GB/s",
-        "seq_config":            "32 prefill + 32 decode",
+        "seq_config":            "128 prefill + 128 decode",
         "notes": (
             "Titanus: DCIM-based accelerator (GLSVLSI 2025). "
             "Latency is post-pipeline-optimization (intra+inter-layer). "
-            "Energy metric denominator differs from Kelle (see ARCHITECTURE.md). "
-            "Kelle comparison run: 32 prefill + 32 decode for consistency."
+            "At 128+128, KV cache access dominates Titanus energy (66%) vs weights (33%). "
+            "Kelle comparison run: 128 prefill + 128 decode for consistency."
         ),
     }
 }

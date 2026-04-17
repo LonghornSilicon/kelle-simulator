@@ -111,7 +111,7 @@ class SystolicEvictor:
 
     # ── Eviction candidate search ─────────────────────────────────────────────
 
-    def find_eviction_candidate(self) -> Tuple[Optional[int], int]:
+    def find_eviction_candidate(self, cached_token_ids=None) -> Tuple[Optional[int], int]:
         """
         Identify the token with the lowest importance score that is neither
         an initial token nor a recent token (those are always preserved).
@@ -144,7 +144,8 @@ class SystolicEvictor:
             is_initial = i < initial_preserved
             is_recent  = i >= recent_threshold
             if not is_initial and not is_recent:
-                candidates.append(self._scores[tid])
+                if cached_token_ids is None or tid in cached_token_ids:
+                    candidates.append(self._scores[tid])
 
         if not candidates:
             return None, search_cycles
